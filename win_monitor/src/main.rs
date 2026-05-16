@@ -12,7 +12,7 @@ use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFOR
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId};
 
 // Target focus duration in seconds (10 minutes)
-const TARGET_DURATION_SECS: u64 = 600;
+const TARGET_DURATION_SECS: u64 = 60;
 // Polling interval in seconds
 const POLL_INTERVAL_SECS: u64 = 5;
 
