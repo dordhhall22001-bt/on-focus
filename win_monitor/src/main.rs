@@ -11,20 +11,26 @@ use std::time::{Duration, Instant};
 use ini::Ini;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, MAX_PATH, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Power::RegisterSuspendResumeNotification;
+use windows::Win32::System::Power::{RegisterSuspendResumeNotification, RegisterPowerSettingNotification, POWERBROADCAST_SETTING};
+use windows::core::GUID;
 use windows::Win32::System::RemoteDesktop::{WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION};
 use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetForegroundWindow, GetMessageW,
     GetWindowThreadProcessId, PostQuitMessage, RegisterClassW, TranslateMessage,
-    CW_USEDEFAULT, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, WM_POWERBROADCAST,
+    CW_USEDEFAULT, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, WM_POWERBROADCAST, PBT_POWERSETTINGCHANGE,
     WM_WTSSESSION_CHANGE, WNDCLASSW, WTS_SESSION_LOCK, WTS_SESSION_LOGOFF, WTS_SESSION_LOGON,
     WTS_SESSION_UNLOCK,
 };
 
 const DEVICE_NOTIFY_WINDOW_HANDLE: u32 = 0;
-const POLL_INTERVAL_SECS: u64 = 60; // 1 minute
+
+const GUID_CONSOLE_DISPLAY_STATE: GUID = GUID::from_values(
+    0x271a8220, 0x40d2, 0x4d1e, [0xae, 0x4b, 0xef, 0xc1, 0x0a, 0x2d, 0x9b, 0x55]
+);
+const TARGET_DURATION_SECS: u64 = 60;
+const POLL_INTERVAL_SECS: u64 = 5; // 1 minute
 const REPORT_INTERVAL_SECS: u64 = 3600; // 1 hour
 
 #[derive(Debug, Clone)]
@@ -75,12 +81,20 @@ fn send_telegram_message(config: &Config, message: &str) {
         .send_string(&payload.to_string());
 }
 
-fn get_foreground_app_exe() -> Option<String> {
+fn get_foreground_app_info() -> Option<(String, String)> {
     unsafe {
         let hwnd: HWND = GetForegroundWindow();
         if hwnd.0.is_null() {
             return None;
         }
+
+        let mut title_buffer = [0u16; 512];
+        let title_len = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(hwnd, &mut title_buffer);
+        let title = if title_len > 0 {
+            String::from_utf16_lossy(&title_buffer[..title_len as usize])
+        } else {
+            String::new()
+        };
 
         let mut process_id: u32 = 0;
         GetWindowThreadProcessId(hwnd, Some(&mut process_id as *mut _));
@@ -109,7 +123,7 @@ fn get_foreground_app_exe() -> Option<String> {
             let path_str = String::from_utf16_lossy(&buffer[..len as usize]);
             let path = std::path::Path::new(&path_str);
             if let Some(file_name) = path.file_name() {
-                return Some(file_name.to_string_lossy().into_owned());
+                return Some((file_name.to_string_lossy().into_owned(), title));
             }
         }
     }
@@ -163,17 +177,31 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
     match msg {
         WM_POWERBROADCAST => {
             if let Ok(mut state_guard) = APP_STATE.lock()
-                && let Some(state) = state_guard.as_mut() {
-                    match wparam.0 as u32 {
-                        PBT_APMRESUMEAUTOMATIC => {
-                            handle_login_wake(state, "login");
-                        }
-                        PBT_APMSUSPEND => {
-                            send_usage_report(state, "sleep");
-                        }
-                        _ => {}
+                && let Some(state) = state_guard.as_mut()
+            {
+                match wparam.0 as u32 {
+                    PBT_APMRESUMEAUTOMATIC => {
+                        handle_login_wake(state, "login");
                     }
+                    PBT_APMSUSPEND => {
+                        send_usage_report(state, "sleep");
+                    }
+                    PBT_POWERSETTINGCHANGE => {
+                        let setting = unsafe { &*(lparam.0 as *const POWERBROADCAST_SETTING) };
+                        if setting.PowerSetting == GUID_CONSOLE_DISPLAY_STATE && setting.DataLength == 4 {
+                            let data = unsafe { *(setting.Data.as_ptr() as *const u32) };
+                            if data == 0 {
+                                // Display off (lid closed usually)
+                                send_usage_report(state, "sleep");
+                            } else if data == 1 {
+                                // Display on
+                                handle_login_wake(state, "login");
+                            }
+                        }
+                    }
+                    _ => {}
                 }
+            }
             LRESULT(1)
         }
         WM_WTSSESSION_CHANGE => {
@@ -240,7 +268,15 @@ fn run_message_loop() {
         }
 
         let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
-        let _ = RegisterSuspendResumeNotification(windows::Win32::Foundation::HANDLE(hwnd.0), windows::Win32::UI::WindowsAndMessaging::REGISTER_NOTIFICATION_FLAGS(DEVICE_NOTIFY_WINDOW_HANDLE));
+        let _ = RegisterSuspendResumeNotification(
+            windows::Win32::Foundation::HANDLE(hwnd.0),
+            windows::Win32::UI::WindowsAndMessaging::REGISTER_NOTIFICATION_FLAGS(DEVICE_NOTIFY_WINDOW_HANDLE),
+        );
+        let _ = RegisterPowerSettingNotification(
+            windows::Win32::Foundation::HANDLE(hwnd.0),
+            &GUID_CONSOLE_DISPLAY_STATE,
+            windows::Win32::UI::WindowsAndMessaging::REGISTER_NOTIFICATION_FLAGS(DEVICE_NOTIFY_WINDOW_HANDLE),
+        );
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).into() {
@@ -292,41 +328,76 @@ fn main() {
         run_message_loop();
     });
 
-    // Main loop for tracking focus
-    let _last_tick = unsafe { windows::Win32::System::SystemInformation::GetTickCount() };
+
+    let mut current_app_info: Option<(String, String)> = None;
+    let mut app_focus_start: Instant = Instant::now();
+    let mut notification_sent = false;
+    let mut last_stat_minute_tick = Instant::now();
 
     loop {
         thread::sleep(Duration::from_secs(POLL_INTERVAL_SECS));
 
-        let current_tick = unsafe { windows::Win32::System::SystemInformation::GetTickCount() };
-        let last_input = get_last_input_time();
+        let active_app_info = get_foreground_app_info();
 
-        // Handle tick wrap around if needed (rare, roughly 49 days)
-        let elapsed_since_input = if current_tick >= last_input {
-            current_tick - last_input
-        } else {
-            (u32::MAX - last_input) + current_tick
+        let app_changed = match (&active_app_info, &current_app_info) {
+            (Some((active_app_name, _)), Some((current_app_name, _))) => active_app_name != current_app_name,
+            (None, None) => false,
+            _ => true,
         };
 
-        // If elapsed since input is less than a minute (60_000 ms), record usage
-        let active_minute = elapsed_since_input <= 60_000;
+        if app_changed {
+            current_app_info = active_app_info.clone();
+            app_focus_start = Instant::now();
+            notification_sent = false;
+        } else if let Some((app_name, _)) = current_app_info.clone() {
+            if let Some((_, ref new_title)) = active_app_info {
+                current_app_info = Some((app_name.clone(), new_title.clone()));
+            }
 
-        let mut app_to_credit = None;
-        if active_minute {
-            app_to_credit = get_foreground_app_exe();
+            let elapsed = app_focus_start.elapsed().as_secs();
+
+            if elapsed >= TARGET_DURATION_SECS && !notification_sent {
+                let title_to_send = current_app_info.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
+                let alert_msg = format!("{} - {}", app_name, title_to_send);
+                if let Ok(state_guard) = APP_STATE.lock()
+                    && let Some(state) = state_guard.as_ref() {
+                        send_telegram_message(&state.config, &alert_msg);
+                    }
+                notification_sent = true;
+            }
         }
 
-        if let Ok(mut state_guard) = APP_STATE.lock()
-            && let Some(state) = state_guard.as_mut() {
-                // Record usage
-                if let Some(app) = app_to_credit {
-                    *state.stats.entry(app).or_insert(0) += 1;
-                }
+        // Check if 60 seconds have passed for usage statistics
+        if last_stat_minute_tick.elapsed().as_secs() >= 60 {
+            last_stat_minute_tick = Instant::now();
 
-                // Check for hourly report
-                if state.last_report_time.elapsed().as_secs() >= REPORT_INTERVAL_SECS {
+            let current_tick = unsafe { windows::Win32::System::SystemInformation::GetTickCount() };
+            let last_input = get_last_input_time();
+
+            let elapsed_since_input = if current_tick >= last_input {
+                current_tick - last_input
+            } else {
+                (u32::MAX - last_input) + current_tick
+            };
+
+            let active_minute = elapsed_since_input <= 60_000;
+
+            if active_minute
+                && let Some((app, _)) = &active_app_info
+                    && let Ok(mut state_guard) = APP_STATE.lock()
+                        && let Some(state) = state_guard.as_mut() {
+                            *state.stats.entry(app.clone()).or_insert(0) += 1;
+                        }
+        }
+
+        // Hourly report
+        if let Ok(mut state_guard) = APP_STATE.lock()
+            && let Some(state) = state_guard.as_mut()
+                && state.last_report_time.elapsed().as_secs() >= REPORT_INTERVAL_SECS {
                     send_usage_report(state, "hourly");
+                    // Important: send_usage_report resets the timer. But if empty, it doesn't.
+                    // We must update last_report_time even if empty, so it doesn't poll rapidly.
+                    state.last_report_time = Instant::now();
                 }
-            }
     }
 }
