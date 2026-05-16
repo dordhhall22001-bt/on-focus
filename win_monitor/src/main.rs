@@ -8,8 +8,7 @@ use std::time::{Duration, Instant};
 
 use ini::Ini;
 use windows::Win32::Foundation::{HWND, MAX_PATH, HMODULE};
-use windows::Win32::System::ProcessStatus::K32GetModuleFileNameExW;
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, PROCESS_NAME_WIN32};
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 // Target focus duration in seconds (10 minutes)
@@ -44,9 +43,8 @@ fn load_config() -> Result<Config, String> {
     Ok(Config { bot_token, chat_id })
 }
 
-fn send_telegram_message(config: &Config, app_name: &str, duration_mins: u64) {
+fn send_telegram_message(config: &Config, message: &str) {
     let url = format!("https://api.telegram.org/bot{}/sendMessage", config.bot_token);
-    let message = format!("Alert: You have been using {} for over {} minutes.", app_name, duration_mins);
 
     let payload = serde_json::json!({
         "chat_id": config.chat_id,
@@ -88,11 +86,17 @@ fn get_foreground_app_name() -> Option<String> {
         };
 
         let mut buffer = [0u16; MAX_PATH as usize];
-        let len = K32GetModuleFileNameExW(Some(process_handle), Some(HMODULE::default()), &mut buffer);
+        let mut len = MAX_PATH;
+        let success = QueryFullProcessImageNameW(
+            process_handle,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR::from_raw(buffer.as_mut_ptr()),
+            &mut len,
+        );
 
         let _ = windows::Win32::Foundation::CloseHandle(process_handle);
 
-        if len > 0 {
+        if success.is_ok() && len > 0 {
             let path_str = String::from_utf16_lossy(&buffer[..len as usize]);
             // Extract just the executable name from the path
             let path = std::path::Path::new(&path_str);
@@ -114,6 +118,9 @@ fn main() {
         }
     };
 
+    // Send startup welcome notification
+    send_telegram_message(&config, "Hello! Windows Activity Monitor service has started.");
+
     let mut current_app: Option<String> = None;
     let mut app_focus_start: Instant = Instant::now();
     let mut notification_sent = false;
@@ -132,7 +139,8 @@ fn main() {
 
             if elapsed >= TARGET_DURATION_SECS && !notification_sent {
                 // Time exceeded, send notification
-                send_telegram_message(&config, app_name, elapsed / 60);
+                let alert_msg = format!("Alert: You have been using {} for over {} minutes.", app_name, elapsed / 60);
+                send_telegram_message(&config, &alert_msg);
                 notification_sent = true; // ensure we only send once per continuous session
             }
         }
